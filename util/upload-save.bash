@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Check if both arguments are provided
 if [ $# -ne 2 ]; then
     echo "Usage: $0 <path_to_MySave.zip> <ec2_address>"
