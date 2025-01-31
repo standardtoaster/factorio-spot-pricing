@@ -58,6 +58,33 @@ Parameters:
     Description: (Optional - An empty value disables this feature)
     Default: ''
 
+  route53domain:
+    Type: String
+    Description:  domain to use in route53
+    Default: ''
+
+  route53subdomain:
+    Type: String
+    Description: sub domain to use from the domain
+    Default: ''
+
+  route53zoneID:
+    Type: String
+    Description: Zone ID for route 53
+    Default: ''
+
+  sleeptime:
+    Type: Number
+    Description: time to sleep before setting DNS in seconds
+    Default: 60
+
+  ttltime:
+    Type: Number
+    Description:  TTL time for DNS
+    Default: 60
+
+
+
   HostedZoneId:
     Type: String
     Description: (Optional - An empty value disables this feature) If you have a hosted zone in Route 53 and wish to set a DNS record whenever your Factorio instance starts, supply the hosted zone ID here.
@@ -153,6 +180,7 @@ Metadata:
         default: "Do you wish to update your mods on container start"
       AutoUpdateServer:
         default: "Should the server automatically update when new versions are available?"
+
 Conditions:
   KeyPairNameProvided: !Not [ !Equals [ !Ref KeyPairName, '' ] ]
   IpAddressProvided: !Not [ !Equals [ !Ref YourIp, '' ] ]
@@ -237,6 +265,7 @@ Resources:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
       RouteTableId: !Ref RouteTable
+
 
   # ====================================================
   # EFS FOR PERSISTENT DATA
@@ -324,6 +353,28 @@ Resources:
           Fn::Base64: !Sub |
             #!/bin/bash -xe
             echo ECS_CLUSTER=${EcsCluster} >> /etc/ecs/ecs.config
+            sleep ${sleeptime}
+            DNS=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+            aws route53 change-resource-record-sets \
+              --hosted-zone-id ${route53zoneID} \
+              --change-batch '
+              {
+                "Comment": "Testing creating a record set"
+                ,"Changes": [{
+                  "Action"              : "CREATE"
+                  ,"ResourceRecordSet"  : {
+                    "Name"              : "'" ${route53subdomain} "'.${route53domain}"
+                    ,"Type"             : "CNAME"
+                    ,"TTL"              : ${ttltime}
+                    ,"ResourceRecords"  : [{
+                        "Value"         : "'" $DNS "'"
+                    }]
+                  }
+                }]
+              }
+              '
+
+
 
   AutoScalingGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
@@ -377,6 +428,9 @@ Resources:
             Statement:
               - Effect: "Allow"
                 Action: "route53:*"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: "ec2:DescribeInstance*"
                 Resource: "*"
 
   InstanceProfile:
@@ -433,104 +487,8 @@ Resources:
           - Name: DLC_SPACE_AGE
             Value: !Sub "${DlcSpaceAge}"
 
-  # ====================================================
-  # SET DNS RECORD
-  # ====================================================
 
-  SetDNSRecordLambdaRole:
-    Type: AWS::IAM::Role
-    Condition: DnsConfigEnabled
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-        - Effect: Allow
-          Principal:
-            Service:
-            - lambda.amazonaws.com
-          Action:
-          - sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: root
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: "Allow"
-                Action: "route53:*"
-                Resource: "*"
-              - Effect: "Allow"
-                Action: "ec2:DescribeInstance*"
-                Resource: "*"
 
-  SetDNSRecordLambda:
-    Type: "AWS::Lambda::Function"
-    Condition: DnsConfigEnabled
-    Properties:
-      Environment:
-        Variables:
-          HostedZoneId: !Ref HostedZoneId
-          RecordName: !Ref RecordName
-      Code:
-        ZipFile: |
-          import boto3
-          import os
-          def handler(event, context):
-            new_instance = boto3.resource('ec2').Instance(event['detail']['EC2InstanceId'])
-            boto3.client('route53').change_resource_record_sets(
-              HostedZoneId= os.environ['HostedZoneId'],
-              ChangeBatch={
-                  'Comment': 'updating',
-                  'Changes': [
-                      {
-                          'Action': 'UPSERT',
-                          'ResourceRecordSet': {
-                              'Name': os.environ['RecordName'],
-                              'Type': 'A',
-                              'TTL': 60,
-                              'ResourceRecords': [
-                                  {
-                                      'Value': new_instance.public_ip_address
-                                  },
-                              ]
-                          }
-                      },
-                  ]
-              })
-      Description: Sets Route 53 DNS Record for Factorio
-      FunctionName: !Sub "${AWS::StackName}-set-dns"
-      Handler: index.handler
-      MemorySize: 128
-      Role: !GetAtt SetDNSRecordLambdaRole.Arn
-      Runtime: python3.12
-      Timeout: 20
-
-  LaunchEvent:
-    Type: AWS::Events::Rule
-    Condition: DnsConfigEnabled
-    Properties:
-      EventPattern:
-        source:
-        - aws.autoscaling
-        detail-type:
-        - EC2 Instance Launch Successful
-        detail:
-          AutoScalingGroupName:
-          - !Ref AutoScalingGroup
-      Name: !Sub "${AWS::StackName}-instance-launch"
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt SetDNSRecordLambda.Arn
-          Id: !Sub "${AWS::StackName}-set-dns"
-
-  LaunchEventLambdaPermission:
-    Type: AWS::Lambda::Permission
-    Condition: DnsConfigEnabled
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !GetAtt SetDNSRecordLambda.Arn
-      Principal: events.amazonaws.com
 
   # ====================================================
   # AUTO UPDATE CONFIGURATION
