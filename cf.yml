@@ -92,6 +92,24 @@ Parameters:
     - true
     - false
 
+  ServerName:
+    Type: String
+    Description: "The name of the Factorio server."
+    Default: "My Factorio Server"
+
+  ServerDescription:
+    Type: String
+    Description: "A description for the Factorio server."
+    Default: "Welcome to my Factorio server!"
+
+  ServerVisibility:
+    Type: String
+    Description: "The visibility of the server (public or private)."
+    Default: "false"
+    AllowedValues:
+    - "true"
+    - "false"
+
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -121,6 +139,12 @@ Metadata:
         Parameters:
         - HostedZoneId
         - RecordName
+      - Label:
+          default: Server Configuration
+        Parameters:
+        - ServerName
+        - ServerDescription
+        - ServerVisibility
     ParameterLabels:
       FactorioImageTag:
         default: "Which version of Factorio do you want to launch?"
@@ -142,6 +166,13 @@ Metadata:
         default: "Do you wish to enable RCON?"
       UpdateModsOnStart:
         default: "Do you wish to update your mods on container start"
+      ServerName:
+        default: "The name of the Factorio server."
+      ServerDescription:
+        default: "A description for the Factorio server."
+      ServerVisibility:
+        default: "The visibility of the server (public or private)."
+
 Conditions:
   KeyPairNameProvided: !Not [ !Equals [ !Ref KeyPairName, '' ] ]
   IpAddressProvided: !Not [ !Equals [ !Ref YourIp, '' ] ]
@@ -224,7 +255,7 @@ Resources:
     Properties:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
-      RouteTableId: !Ref RouteTable
+      RouteTableId: !Ref RouteTable 
 
   # ====================================================
   # EFS FOR PERSISTENT DATA
@@ -265,6 +296,20 @@ Resources:
         IpProtocol: tcp
         SourceSecurityGroupId: !Ref Ec2Sg
       VpcId: !Ref Vpc
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref Efs
+      PosixUser:
+        Uid: "0"  # Replace with the desired user ID
+        Gid: "0"  # Replace with the desired group ID
+      RootDirectory:
+        Path: "/"  # Replace with the desired root directory path
+        CreationInfo:
+          OwnerUid: "845"  # Replace with the desired owner user ID
+          OwnerGid: "845"  # Replace with the desired owner group ID
+          Permissions: "755"  # Replace with the desired permissions
 
   # ====================================================
   # INSTANCE CONFIG
@@ -520,6 +565,168 @@ Resources:
       FunctionName: !GetAtt SetDNSRecordLambda.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt LaunchEvent.Arn
+
+  # ====================================================
+  # Write Config
+  # ====================================================
+
+  ConfigWriterLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemClientFullAccess
+      Policies:
+        - PolicyName: LambdaEFSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !GetAtt Efs.Arn
+        - PolicyName: LambdaVPCAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: '*'
+        - PolicyName: LambdaInvokePermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: '*' 
+
+  ConfigWriterLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - MountA
+      - MountB  
+    Properties:
+      Handler: index.handler
+      Timeout: 300 # 5 minutes
+      Role: !GetAtt ConfigWriterLambdaExecutionRole.Arn
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetA
+          - !Ref SubnetB
+        SecurityGroupIds:
+          - !Ref Ec2Sg
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import logging
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ec2 = boto3.client('ec2')
+
+          def handler(event, context):
+              logger.info("Starting config writer lambda")
+              logger.info(f"Event: {json.dumps(event)}")
+
+              # Initialize config
+              config = {}
+              efs_path = '/mnt/efs/config/server-settings.json'
+              # Load existing config
+              if os.path.exists(efs_path):
+                  with open(efs_path, 'r') as f:
+                      config = json.load(f)
+                  logger.info("Loaded existing config")
+              else:
+                  logger.warning("Config file not found, creating a new one")
+
+              # Update config with new values
+              config.update({
+                  "name": os.environ['SERVER_NAME'],
+                  "description": os.environ['SERVER_DESCRIPTION'],
+                  "visibility": {
+                      "public": os.environ['SERVER_VISIBILITY'] == 'true'
+                  }
+              })
+              logger.info(f"Updated config: {json.dumps(config)}")
+              
+              # Write updated config back to file
+              logger.info(f"Writing updated config to {efs_path}")
+              os.makedirs(os.path.dirname(efs_path), exist_ok=True)
+              with open(efs_path, 'w') as f:
+                  json.dump(config, f)
+              os.chown(os.path.dirname(efs_path), 845, 845)
+              os.chown(efs_path, 845, 845)
+              logger.info("Config file written successfully")
+              
+              # Restart ECS tasks
+              ecs = boto3.client('ecs')
+              cluster = os.environ['ECS_CLUSTER']
+              service = os.environ['ECS_SERVICE']
+              
+              logger.info(f"Restarting tasks in cluster {cluster}, service {service}")
+              response = ecs.update_service(
+                  cluster=cluster,
+                  service=service,
+                  forceNewDeployment=True
+              )
+              logger.info("ECS service update initiated")
+                  
+      Runtime: python3.12
+      Description: Writes config to EFS and restarts ECS tasks
+      FunctionName: !Sub "${AWS::StackName}-write-config"
+      Environment:
+        Variables:
+          SERVER_NAME: !Ref ServerName
+          SERVER_DESCRIPTION: !Ref ServerDescription
+          SERVER_VISIBILITY: !Ref ServerVisibility
+          ECS_CLUSTER: !Ref EcsCluster
+          ECS_SERVICE: !Sub "${AWS::StackName}-ecs-service"
+      FileSystemConfigs:
+        - Arn: !GetAtt EfsAccessPoint.Arn
+          LocalMountPath: /mnt/efs
+
+  StackUpdateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger Lambda on CloudFormation stack create or update"
+      EventPattern:
+        source:
+          - "aws.cloudformation"
+        detail-type:
+          - "CloudFormation Stack Status Change"
+        detail:
+          status-details:
+            status:
+              - "CREATE_COMPLETE"
+              - "UPDATE_COMPLETE"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ConfigWriterLambda.Arn
+          Id: "ConfigWriterLambdaTarget"
+
+  StackUpdateEventLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt ConfigWriterLambda.Arn
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt StackUpdateEventRule.Arn
 
 Outputs:
   CheckInstanceIp:
